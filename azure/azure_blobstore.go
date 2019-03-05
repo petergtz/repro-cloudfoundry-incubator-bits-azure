@@ -227,7 +227,7 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 	for i, eof := 0, false; !eof; {
 		const maxBlocksPerBlob = 50000 // using information from https://docs.microsoft.com/en-us/rest/api/storageservices/understanding-block-blobs--append-blobs--and-page-blobs
 		if i >= maxBlocksPerBlob {
-			return errors.Errorf("block blob cannot have more than 50,000 blocks. path: %v, put-request-id: %v", path, putRequestID)
+			return errors.Errorf("block blob cannot have more than %d blocks. path: %v, put-request-id: %v", maxBlocksPerBlob, path, putRequestID)
 		}
 		blockID := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%05d", i)))
 		data := make([]byte, blobstore.putBlockSize)
@@ -248,13 +248,21 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 		fmt.Println("PutBlock", "block-index", i, "block-id", blockID, "block-size", numBytesRead, "is-eof", eof)
 		e = backoff.RetryNotify(func() error {
 			return blob.PutBlock(blockID, data[:numBytesRead], &storage.PutBlockOptions{LeaseID: lease.LeaseID})
-		}, backoff.WithMaxRetries(backoff.NewExponentialBackOff(), 2), func(error, time.Duration) {
-			// l.Infow("Retry PutBlock", "block-index", i, "block-id", block.ID, "block-size", numBytesRead, "is-eof", eof)
-			fmt.Println("Retry PutBlock", "block-index", i, "block-id", blockID, "block-size", numBytesRead, "is-eof", eof)
-			// blobstore.metricsService.SendCounterMetric("put-block-retry", 1)
+		}, backoff.WithMaxRetries(backoff.NewExponentialBackOff(), 2), func(e error, d time.Duration) {
+			if azse, ok := e.(storage.AzureStorageServiceError); ok {
+				fmt.Println("Retry PutBlock", "block-index", i, "block-id", blockID, "block-size", numBytesRead, "is-eof", eof, "error", e, "x-ms-request-id", azse.RequestID)
+			} else {
+				// l.Infow("Retry PutBlock", "block-index", i, "block-id", block.ID, "block-size", numBytesRead, "is-eof", eof)
+				fmt.Println("Retry PutBlock", "block-index", i, "block-id", blockID, "block-size", numBytesRead, "is-eof", eof, "error", e)
+				// blobstore.metricsService.SendCounterMetric("put-block-retry", 1)
+			}
 		})
 		if e != nil {
-			return errors.Wrapf(e, "put block failed. path: %v, put-request-id: %v", path, putRequestID)
+			if azse, ok := e.(storage.AzureStorageServiceError); ok {
+				return errors.Wrapf(e, "PutBlock() failed. path: %v, put-request-id: %v, x-ms-request-id: %s", path, putRequestID, azse.RequestID)
+			} else {
+				return errors.Wrapf(e, "PutBlock() failed. path: %v, put-request-id: %v", path, putRequestID)
+			}
 		}
 		uncommittedBlocksList = append(uncommittedBlocksList, storage.Block{
 			ID:     blockID,
@@ -273,7 +281,11 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 		// blobstore.metricsService.SendCounterMetric("put-block-list-retry", 1)
 	})
 	if e != nil {
-		return errors.Wrapf(e, "put block list failed. path: %v, put-request-id: %v", path, putRequestID)
+		if azse, ok := e.(storage.AzureStorageServiceError); ok {
+			return errors.Wrapf(e, "PutBlockList() failed. path: %v, put-request-id: %v, x-ms-request-id: %s", path, putRequestID, azse.RequestID)
+		} else {
+			return errors.Wrapf(e, "PutBlockList() failed. path: %v, put-request-id: %v", path, putRequestID)
+		}
 	}
 
 	return nil
