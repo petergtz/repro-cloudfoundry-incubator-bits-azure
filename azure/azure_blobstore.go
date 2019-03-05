@@ -133,34 +133,69 @@ func (blobstore *Blobstore) GetOrRedirect(path string) (body io.ReadCloser, redi
 	return nil, signedUrl, e
 }
 
-func (blobstore *Blobstore) SimulateTwoUploadsToTheSameBlob(path string) error {
-	blob := blobstore.client.GetContainerReference(blobstore.containerName).GetBlobReference(path)
+type azureBlobLease struct {
+	Duration     time.Duration
+	Blobstore    *Blobstore
+	Blob         *storage.Blob
+	LeaseID      string
+	DoneChannel  chan bool
+	ErrorChannel chan error
+}
 
-	// Upload 5 blocks
-	uncommittedBlocksList := make([]storage.Block, 0)
-	for i := 0; i < 5; i++ {
-		blockID := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%05d", i)))
-		data := make([]byte, 128)
+func (blobstore *Blobstore) newBlobLease(duration time.Duration, blob *storage.Blob) *azureBlobLease {
+	return &azureBlobLease{
+		DoneChannel:  make(chan bool, 1),
+		ErrorChannel: make(chan error, 1),
+		Duration:     duration,
+		Blobstore:    blobstore,
+		Blob:         blob,
+		LeaseID:      "",
+	}
+}
 
-		err := blob.PutBlock(blockID, data, nil)
-		if err != nil {
-			return err
+func (l *azureBlobLease) hold() error {
+	fmt.Printf("create lease on %s\n", l.Blob.Name)
+
+	leaseDurationInSeconds := int(l.Duration.Seconds())
+	returnedLeaseID, err := l.Blob.AcquireLease(leaseDurationInSeconds, "", nil)
+	if err != nil {
+		if azse, ok := err.(storage.AzureStorageServiceError); ok && azse.StatusCode == http.StatusPreconditionFailed && azse.Code == "LeaseIdMissing" {
+			fmt.Println("XXX", azse.Code)
+			return l.Blobstore.handleError(azse, "Another upload is in progress for blob %s/%s", l.Blobstore.containerName, l.Blob.Name)
 		}
-		block := storage.Block{
-			ID:     blockID,
-			Status: storage.BlockStatusUncommitted,
-		}
-		uncommittedBlocksList = append(uncommittedBlocksList, block)
+		fmt.Println("XXX", err)
+		return err
 	}
 
-	// Pretent the first (quicker uploader) commits blocks 0-2
-	if err := blob.PutBlockList(uncommittedBlocksList[:3], nil); err != nil {
-		return fmt.Errorf("subblocl %s", err)
-	}
-	// at the point, the blocks 3 and 4 are garbage-collected
+	l.LeaseID = returnedLeaseID
+	go func(l *azureBlobLease) {
+		for {
+			select {
+			case done := <-l.DoneChannel:
+				if !done {
+				}
 
-	// Now this fails storage: service returned error: StatusCode=400, ErrorCode=InvalidBlockList, ErrorMessage=The specified block list is invalid.
-	return blob.PutBlockList(uncommittedBlocksList, nil)
+				l.ErrorChannel <- l.Blob.ReleaseLease(l.LeaseID, nil)
+				return
+			case <-time.After(l.Duration):
+				err := l.Blob.RenewLease(l.LeaseID, nil)
+				if err != nil {
+					fmt.Printf("Error during RenewLease: %s\n", err)
+				}
+				fmt.Println("renew lease")
+			}
+		}
+	}(l)
+
+	return nil
+}
+
+func (l *azureBlobLease) release() error {
+	if l.LeaseID == "" {
+		return fmt.Errorf("Lease was not properly created")
+	}
+	l.DoneChannel <- true
+	return <-l.ErrorChannel
 }
 
 func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
@@ -170,17 +205,28 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 	fmt.Println("Put", "bucket", blobstore.containerName, "path", path)
 
 	blob := blobstore.client.GetContainerReference(blobstore.containerName).GetBlobReference(path)
-
 	e := blob.CreateBlockBlob(nil)
 	if e != nil {
-		return errors.Wrapf(e, "create block blob failed. container: %v, path: %v, put-request-id: %v", blobstore.containerName, path, putRequestID)
+		if azse, ok := e.(storage.AzureStorageServiceError); ok && azse.StatusCode == http.StatusPreconditionFailed && azse.Code == "LeaseIdMissing" {
+			return blobstore.handleError(azse, "Another upload is in progress for blob %s/%s (x-ms-request-id %s)", blobstore.containerName, blob.Name, azse.RequestID)
+		}
+		return errors.Wrapf(e, "CreateBlockBlob() failed. container: %v, path: %v, put-request-id: %v", blobstore.containerName, path, putRequestID)
 	}
 
-	uncommittedBlocksList := make([]storage.Block, 0)
+	lease := blobstore.newBlobLease(15*time.Second, blob)
+	if err := lease.hold(); err != nil {
+		return err
+	}
+	defer func() {
+		if err := lease.release(); err != nil {
+			fmt.Printf("Error during lease handling: %s", err)
+		}
+	}()
 
+	uncommittedBlocksList := make([]storage.Block, 0)
 	for i, eof := 0, false; !eof; {
-		// using information from https://docs.microsoft.com/en-us/rest/api/storageservices/understanding-block-blobs--append-blobs--and-page-blobs
-		if i >= 50000 {
+		const maxBlocksPerBlob = 50000 // using information from https://docs.microsoft.com/en-us/rest/api/storageservices/understanding-block-blobs--append-blobs--and-page-blobs
+		if i >= maxBlocksPerBlob {
 			return errors.Errorf("block blob cannot have more than 50,000 blocks. path: %v, put-request-id: %v", path, putRequestID)
 		}
 		blockID := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%05d", i)))
@@ -201,7 +247,7 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 		// l.Debugw("PutBlock", "block-index", i, "block-id", blockID, "block-size", numBytesRead, "is-eof", eof)
 		fmt.Println("PutBlock", "block-index", i, "block-id", blockID, "block-size", numBytesRead, "is-eof", eof)
 		e = backoff.RetryNotify(func() error {
-			return blob.PutBlock(blockID, data[:numBytesRead], nil)
+			return blob.PutBlock(blockID, data[:numBytesRead], &storage.PutBlockOptions{LeaseID: lease.LeaseID})
 		}, backoff.WithMaxRetries(backoff.NewExponentialBackOff(), 2), func(error, time.Duration) {
 			// l.Infow("Retry PutBlock", "block-index", i, "block-id", block.ID, "block-size", numBytesRead, "is-eof", eof)
 			fmt.Println("Retry PutBlock", "block-index", i, "block-id", blockID, "block-size", numBytesRead, "is-eof", eof)
@@ -210,17 +256,17 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 		if e != nil {
 			return errors.Wrapf(e, "put block failed. path: %v, put-request-id: %v", path, putRequestID)
 		}
-		block := storage.Block{
+		uncommittedBlocksList = append(uncommittedBlocksList, storage.Block{
 			ID:     blockID,
 			Status: storage.BlockStatusUncommitted,
-		}
-		uncommittedBlocksList = append(uncommittedBlocksList, block)
-		i = i + 1
+		})
+		i++
 	}
+
 	// l.Debugw("PutBlockList", "uncommitted-block-list", uncommittedBlocksList)
 	fmt.Println("PutBlockList", "uncommitted-block-list", uncommittedBlocksList)
 	e = backoff.RetryNotify(func() error {
-		return blob.PutBlockList(uncommittedBlocksList, nil)
+		return blob.PutBlockList(uncommittedBlocksList, &storage.PutBlockListOptions{LeaseID: lease.LeaseID})
 	}, backoff.WithMaxRetries(backoff.NewExponentialBackOff(), 2), func(error, time.Duration) {
 		// l.Infow("Retry PutBlockList", "uncommitted-block-list", uncommittedBlocksList)
 		fmt.Println("Retry PutBlockList", "uncommitted-block-list", uncommittedBlocksList)
