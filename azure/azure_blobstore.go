@@ -17,10 +17,6 @@ import (
 	"github.com/pkg/errors"
 )
 
-func main() {
-	fmt.Printf("Yeah\n")
-}
-
 type AzureBlobstoreConfig struct {
 	ContainerName string `yaml:"container_name"`
 	AccountName   string `yaml:"account_name"`
@@ -133,71 +129,6 @@ func (blobstore *Blobstore) GetOrRedirect(path string) (body io.ReadCloser, redi
 	return nil, signedUrl, e
 }
 
-type azureBlobLease struct {
-	Duration     time.Duration
-	Blobstore    *Blobstore
-	Blob         *storage.Blob
-	LeaseID      string
-	DoneChannel  chan bool
-	ErrorChannel chan error
-}
-
-func (blobstore *Blobstore) newBlobLease(duration time.Duration, blob *storage.Blob) *azureBlobLease {
-	return &azureBlobLease{
-		DoneChannel:  make(chan bool, 1),
-		ErrorChannel: make(chan error, 1),
-		Duration:     duration,
-		Blobstore:    blobstore,
-		Blob:         blob,
-		LeaseID:      "",
-	}
-}
-
-func (l *azureBlobLease) hold() error {
-	fmt.Printf("create lease on %s\n", l.Blob.Name)
-
-	leaseDurationInSeconds := int(l.Duration.Seconds())
-	returnedLeaseID, err := l.Blob.AcquireLease(leaseDurationInSeconds, "", nil)
-	if err != nil {
-		if azse, ok := err.(storage.AzureStorageServiceError); ok && azse.StatusCode == http.StatusPreconditionFailed && azse.Code == "LeaseIdMissing" {
-			fmt.Println("XXX", azse.Code)
-			return l.Blobstore.handleError(azse, "Another upload is in progress for blob %s/%s", l.Blobstore.containerName, l.Blob.Name)
-		}
-		fmt.Println("XXX", err)
-		return err
-	}
-
-	l.LeaseID = returnedLeaseID
-	go func(l *azureBlobLease) {
-		for {
-			select {
-			case done := <-l.DoneChannel:
-				if !done {
-				}
-
-				l.ErrorChannel <- l.Blob.ReleaseLease(l.LeaseID, nil)
-				return
-			case <-time.After(l.Duration):
-				err := l.Blob.RenewLease(l.LeaseID, nil)
-				if err != nil {
-					fmt.Printf("Error during RenewLease: %s\n", err)
-				}
-				fmt.Println("renew lease")
-			}
-		}
-	}(l)
-
-	return nil
-}
-
-func (l *azureBlobLease) release() error {
-	if l.LeaseID == "" {
-		return fmt.Errorf("Lease was not properly created")
-	}
-	l.DoneChannel <- true
-	return <-l.ErrorChannel
-}
-
 func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 	putRequestID := rand.Int63()
 	// l := logger.Log.With("put-request-id", putRequestID)
@@ -227,9 +158,10 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 	for i, eof := 0, false; !eof; {
 		const maxBlocksPerBlob = 50000 // using information from https://docs.microsoft.com/en-us/rest/api/storageservices/understanding-block-blobs--append-blobs--and-page-blobs
 		if i >= maxBlocksPerBlob {
-			return errors.Errorf("block blob cannot have more than %d blocks. path: %v, put-request-id: %v", maxBlocksPerBlob, path, putRequestID)
+			return errors.Errorf("block blob cannot have more than 50,000 blocks. path: %v, put-request-id: %v", path, putRequestID)
 		}
 		blockID := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%05d", i)))
+
 		data := make([]byte, blobstore.putBlockSize)
 		numBytesRead, e := src.Read(data)
 		if e != nil {
@@ -246,6 +178,7 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 		}
 		// l.Debugw("PutBlock", "block-index", i, "block-id", blockID, "block-size", numBytesRead, "is-eof", eof)
 		fmt.Println("PutBlock", "block-index", i, "block-id", blockID, "block-size", numBytesRead, "is-eof", eof)
+
 		e = backoff.RetryNotify(func() error {
 			return blob.PutBlock(blockID, data[:numBytesRead], &storage.PutBlockOptions{LeaseID: lease.LeaseID})
 		}, backoff.WithMaxRetries(backoff.NewExponentialBackOff(), 2), func(e error, d time.Duration) {
@@ -379,4 +312,67 @@ func (blobstore *Blobstore) handleError(e error, context string, args ...interfa
 		return errors.Errorf("bitsgo.NewNotFoundError()")
 	}
 	return errors.Wrapf(e, context, args...)
+}
+
+func (blobstore *Blobstore) newBlobLease(duration time.Duration, blob *storage.Blob) *azureBlobLease {
+	return &azureBlobLease{
+		DoneChannel:  make(chan bool, 1),
+		ErrorChannel: make(chan error, 1),
+		Duration:     duration,
+		Blobstore:    blobstore,
+		Blob:         blob,
+		LeaseID:      "",
+	}
+}
+
+type azureBlobLease struct {
+	Duration     time.Duration
+	Blobstore    *Blobstore
+	Blob         *storage.Blob
+	LeaseID      string
+	DoneChannel  chan bool
+	ErrorChannel chan error
+}
+
+func (l *azureBlobLease) hold() error {
+	fmt.Printf("create lease on %s\n", l.Blob.Name)
+
+	leaseDurationInSeconds := int(l.Duration.Seconds())
+	returnedLeaseID, err := l.Blob.AcquireLease(leaseDurationInSeconds, "", nil)
+	if err != nil {
+		if azse, ok := err.(storage.AzureStorageServiceError); ok && azse.StatusCode == http.StatusPreconditionFailed && azse.Code == "LeaseIdMissing" {
+			return l.Blobstore.handleError(azse, "Another upload is in progress for blob %s/%s", l.Blobstore.containerName, l.Blob.Name)
+		}
+		return err
+	}
+
+	l.LeaseID = returnedLeaseID
+	go func(l *azureBlobLease) {
+		for {
+			select {
+			case done := <-l.DoneChannel:
+				if !done {
+				}
+
+				l.ErrorChannel <- l.Blob.ReleaseLease(l.LeaseID, nil)
+				return
+			case <-time.After(l.Duration):
+				err := l.Blob.RenewLease(l.LeaseID, nil)
+				if err != nil {
+					fmt.Printf("Error during RenewLease: %s\n", err)
+				}
+				fmt.Println("renew lease")
+			}
+		}
+	}(l)
+
+	return nil
+}
+
+func (l *azureBlobLease) release() error {
+	if l.LeaseID == "" {
+		return fmt.Errorf("Lease was not properly created")
+	}
+	l.DoneChannel <- true
+	return <-l.ErrorChannel
 }
