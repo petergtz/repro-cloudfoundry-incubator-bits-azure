@@ -5,16 +5,25 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"math/rand"
 	"net/http"
 	"strings"
 	"time"
+
+	bitsgo "github.com/chgeuer/repro-cloudfoundry-incubator-bits-azure/bits-service"
+	"github.com/chgeuer/repro-cloudfoundry-incubator-bits-azure/logger"
 
 	"github.com/Azure/azure-sdk-for-go/storage"
 	"github.com/Azure/go-autorest/autorest"
 	"github.com/Azure/go-autorest/autorest/azure"
 	"github.com/cenkalti/backoff"
 	"github.com/pkg/errors"
+	"github.com/satori/go.uuid"
+)
+
+const (
+	maxBlocksPerBlob = 50000
+	defaultBlockSize = 50 << 20 // 50 MByte
+	maxBlockSize     = 100 << 20
 )
 
 type AzureBlobstoreConfig struct {
@@ -39,7 +48,7 @@ type Blobstore struct {
 }
 
 func NewBlobstore(config AzureBlobstoreConfig) *Blobstore {
-	return NewBlobstoreWithDetails(config, 50<<20, 5000)
+	return NewBlobstoreWithDetails(config, defaultBlockSize, 5000)
 }
 
 // NetworkErrorRetryingSender is a replacement for the storage.DefaultSender.
@@ -86,13 +95,17 @@ func (sender *NetworkErrorRetryingSender) Send(c *storage.Client, req *http.Requ
 }
 
 func NewBlobstoreWithDetails(config AzureBlobstoreConfig, putBlockSize int64, maxListResults uint) *Blobstore {
+	if putBlockSize > (maxBlockSize) {
+		logger.Log.Fatalw("putBlockSize must be equal or less than 100 MB", "putBlockSize", putBlockSize)
+		return nil
+	}
 	environment, e := azure.EnvironmentFromName(config.EnvironmentName())
 	if e != nil {
-		// logger.Log.Fatalw("Could not get Azure Environment from Name", "error", e, "environment", config.EnvironmentName())
+		logger.Log.Fatalw("Could not get Azure Environment from Name", "error", e, "environment", config.EnvironmentName())
 	}
 	client, e := storage.NewBasicClientOnSovereignCloud(config.AccountName, config.AccountKey, environment)
 	if e != nil {
-		// logger.Log.Fatalw("Could not instantiate Azure Basic Client", "error", e)
+		logger.Log.Fatalw("Could not instantiate Azure Basic Client", "error", e)
 	}
 	client.Sender = &NetworkErrorRetryingSender{}
 	return &Blobstore{
@@ -112,7 +125,7 @@ func (blobstore *Blobstore) Exists(path string) (bool, error) {
 }
 
 func (blobstore *Blobstore) Get(path string) (body io.ReadCloser, err error) {
-	// logger.Log.Debugw("Get", "bucket", blobstore.containerName, "path", path)
+	logger.Log.Debugw("Get", "bucket", blobstore.containerName, "path", path)
 
 	reader, e := blobstore.client.GetContainerReference(blobstore.containerName).GetBlobReference(path).Get(nil)
 	if e != nil {
@@ -130,35 +143,40 @@ func (blobstore *Blobstore) GetOrRedirect(path string) (body io.ReadCloser, redi
 }
 
 func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
-	putRequestID := rand.Int63()
-	// l := logger.Log.With("put-request-id", putRequestID)
-	// l.Debugw("Put", "bucket", blobstore.containerName, "path", path)
-	fmt.Println("Put", "bucket", blobstore.containerName, "path", path)
+	//
+	// Upload strategy:
+	// It can happen that multiple clients request uploads into the same blob.
+	// To prevent collisions, each client uploads to a unique file first, then copies to the final blob, and deletes the original upload.
+	//
+	putRequestID := uuid.Must(uuid.NewV4()) // rand.Int63()
+	temporaryPath := fmt.Sprintf("%s.__upload__%s", path, putRequestID)
 
-	blob := blobstore.client.GetContainerReference(blobstore.containerName).GetBlobReference(path)
-	e := blob.CreateBlockBlob(nil)
+	l := logger.Log.With("put-request-id", putRequestID)
+	l.Debugw("Put", "bucket", blobstore.containerName, "path", path, "temporaryPath", temporaryPath)
+
+	temporaryBlob := blobstore.client.GetContainerReference(blobstore.containerName).GetBlobReference(temporaryPath)
+	e := temporaryBlob.CreateBlockBlob(&storage.PutBlobOptions{})
 	if e != nil {
 		if azse, ok := e.(storage.AzureStorageServiceError); ok && azse.StatusCode == http.StatusPreconditionFailed && azse.Code == "LeaseIdMissing" {
-			return blobstore.handleError(azse, "Another upload is in progress for blob %s/%s (x-ms-request-id %s)", blobstore.containerName, blob.Name, azse.RequestID)
+			return blobstore.handleError(azse, "Another upload is in progress for blob %s/%s (x-ms-request-id %s)", blobstore.containerName, temporaryPath, azse.RequestID)
 		}
-		return errors.Wrapf(e, "CreateBlockBlob() failed. container: %v, path: %v, put-request-id: %v", blobstore.containerName, path, putRequestID)
+		return errors.Wrapf(e, "CreateBlockBlob() failed. container: %v, temporaryPath: %v, put-request-id: %v", blobstore.containerName, temporaryPath, putRequestID)
 	}
 
-	lease := blobstore.newBlobLease(15*time.Second, blob)
-	if err := lease.hold(); err != nil {
-		return err
-	}
-	defer func() {
-		if err := lease.release(); err != nil {
-			fmt.Printf("Error during lease handling: %s", err)
-		}
-	}()
+	// lease := blobstore.newBlobLease(15*time.Second, temporaryBlob)
+	// if err := lease.acquire(); err != nil {
+	// 	return err
+	// }
+	// defer func() {
+	// 	if err := lease.release(); err != nil {
+	// 		fmt.Printf("Error during lease handling: %s", err)
+	// 	}
+	// }()
 
 	uncommittedBlocksList := make([]storage.Block, 0)
 	for i, eof := 0, false; !eof; {
-		const maxBlocksPerBlob = 50000 // using information from https://docs.microsoft.com/en-us/rest/api/storageservices/understanding-block-blobs--append-blobs--and-page-blobs
 		if i >= maxBlocksPerBlob {
-			return errors.Errorf("block blob cannot have more than 50,000 blocks. path: %v, put-request-id: %v", path, putRequestID)
+			return errors.Errorf("block blob cannot have more than 50,000 blocks. path: %v, put-request-id: %v", temporaryPath, putRequestID)
 		}
 		blockID := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%05d", i)))
 
@@ -172,29 +190,31 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 			}
 		}
 		if numBytesRead == 0 {
-			// l.Debugw("Empty read", "block-index", i, "block-id", blockID, "is-eof", eof)
-			fmt.Println("Empty read", "block-index", i, "block-id", blockID, "is-eof", eof)
-			continue
+			if eof {
+				break
+			} else {
+				l.Errorf("Empty read", "block-index", i, "block-id", blockID, "is-eof", eof)
+				continue
+			}
 		}
-		// l.Debugw("PutBlock", "block-index", i, "block-id", blockID, "block-size", numBytesRead, "is-eof", eof)
-		fmt.Println("PutBlock", "block-index", i, "block-id", blockID, "block-size", numBytesRead, "is-eof", eof)
+		l.Debugw("PutBlock", "block-index", i, "block-id", blockID, "block-size", numBytesRead, "is-eof", eof)
 
 		e = backoff.RetryNotify(func() error {
-			return blob.PutBlock(blockID, data[:numBytesRead], &storage.PutBlockOptions{LeaseID: lease.LeaseID})
+			// return blob.PutBlock(blockID, data[:numBytesRead], &storage.PutBlockOptions{LeaseID: lease.LeaseID})
+			return temporaryBlob.PutBlock(blockID, data[:numBytesRead], &storage.PutBlockOptions{})
 		}, backoff.WithMaxRetries(backoff.NewExponentialBackOff(), 2), func(e error, d time.Duration) {
 			if azse, ok := e.(storage.AzureStorageServiceError); ok {
-				fmt.Println("Retry PutBlock", "block-index", i, "block-id", blockID, "block-size", numBytesRead, "is-eof", eof, "error", e, "x-ms-request-id", azse.RequestID)
+				l.Infow("Retry PutBlock", "block-index", i, "block-id", blockID, "block-size", numBytesRead, "is-eof", eof, "error", e, "x-ms-request-id", azse.RequestID)
 			} else {
-				// l.Infow("Retry PutBlock", "block-index", i, "block-id", block.ID, "block-size", numBytesRead, "is-eof", eof)
-				fmt.Println("Retry PutBlock", "block-index", i, "block-id", blockID, "block-size", numBytesRead, "is-eof", eof, "error", e)
+				l.Infow("Retry PutBlock", "block-index", i, "block-id", blockID, "block-size", numBytesRead, "is-eof", eof, "error", e)
 				// blobstore.metricsService.SendCounterMetric("put-block-retry", 1)
 			}
 		})
 		if e != nil {
 			if azse, ok := e.(storage.AzureStorageServiceError); ok {
-				return errors.Wrapf(e, "PutBlock() failed. path: %v, put-request-id: %v, x-ms-request-id: %s", path, putRequestID, azse.RequestID)
+				return errors.Wrapf(e, "PutBlock() failed. path: %v, temporaryPath: %v, put-request-id: %v, x-ms-request-id: %s", path, temporaryPath, putRequestID, azse.RequestID)
 			} else {
-				return errors.Wrapf(e, "PutBlock() failed. path: %v, put-request-id: %v", path, putRequestID)
+				return errors.Wrapf(e, "PutBlock() failed. path: %v, temporaryPath: %v, put-request-id: %v", path, temporaryPath, putRequestID)
 			}
 		}
 		uncommittedBlocksList = append(uncommittedBlocksList, storage.Block{
@@ -204,13 +224,24 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 		i++
 	}
 
-	// l.Debugw("PutBlockList", "uncommitted-block-list", uncommittedBlocksList)
-	fmt.Println("PutBlockList", "uncommitted-block-list", uncommittedBlocksList)
+	debugBlockIDAsString := func(l []storage.Block) string {
+		length := len(l)
+		if length == 0 {
+			return "[] (empty?!?)"
+		} else if length == 1 {
+			return fmt.Sprintf("[%v] (%d blocks overall)", l[0].ID, length)
+		} else if length == 2 {
+			return fmt.Sprintf("[%v, %v] (%d blocks overall)", l[0].ID, l[length-1].ID, length)
+		} else {
+			return fmt.Sprintf("[%v, ..., %v] (%d blocks overall)", l[0].ID, l[length-1].ID, length)
+		}
+	}
+	l.Debugw("PutBlockList", "uncommitted-block-list", debugBlockIDAsString(uncommittedBlocksList))
 	e = backoff.RetryNotify(func() error {
-		return blob.PutBlockList(uncommittedBlocksList, &storage.PutBlockListOptions{LeaseID: lease.LeaseID})
+		// return blob.PutBlockList(uncommittedBlocksList, &storage.PutBlockListOptions{LeaseID: lease.LeaseID})
+		return temporaryBlob.PutBlockList(uncommittedBlocksList, &storage.PutBlockListOptions{})
 	}, backoff.WithMaxRetries(backoff.NewExponentialBackOff(), 2), func(error, time.Duration) {
-		// l.Infow("Retry PutBlockList", "uncommitted-block-list", uncommittedBlocksList)
-		fmt.Println("Retry PutBlockList", "uncommitted-block-list", uncommittedBlocksList)
+		l.Infow("Retry PutBlockList", "uncommitted-block-list", debugBlockIDAsString(uncommittedBlocksList))
 		// blobstore.metricsService.SendCounterMetric("put-block-list-retry", 1)
 	})
 	if e != nil {
@@ -221,11 +252,32 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 		}
 	}
 
+	blob := blobstore.client.GetContainerReference(blobstore.containerName).GetBlobReference(path)
+	if copyErr := blob.Copy(temporaryBlob.GetURL(), &storage.CopyOptions{}); copyErr != nil {
+		if azse, ok := copyErr.(storage.AzureStorageServiceError); ok {
+			return errors.Wrapf(copyErr, "Copy() failed. path: %v, temporaryPath: %v, put-request-id: %v, x-ms-request-id: %s", path, temporaryPath, putRequestID, azse.RequestID)
+		} else {
+			return errors.Wrapf(copyErr, "Copy() failed. path: %v, temporaryPath: %v, put-request-id: %v", path, temporaryPath, putRequestID)
+		}
+	} else {
+		l.Debugw("Copy", "source-blob", temporaryBlob.GetURL(), "destination-blob", blob.GetURL())
+	}
+
+	if deleteTempErr := temporaryBlob.Delete(&storage.DeleteBlobOptions{}); deleteTempErr != nil {
+		if azse, ok := deleteTempErr.(storage.AzureStorageServiceError); ok {
+			return errors.Wrapf(deleteTempErr, "Delete() failed. temporaryPath: %v, put-request-id: %v, x-ms-request-id: %s", temporaryPath, putRequestID, azse.RequestID)
+		} else {
+			return errors.Wrapf(deleteTempErr, "Delete() failed. temporaryPath: %v, put-request-id: %v", temporaryPath, putRequestID)
+		}
+	} else {
+		l.Debugw("Delete", "blob", temporaryBlob.GetURL())
+	}
+
 	return nil
 }
 
 func (blobstore *Blobstore) Copy(src, dest string) error {
-	// logger.Log.Debugw("Copy in Azure", "container", blobstore.containerName, "src", src, "dest", dest)
+	logger.Log.Debugw("Copy in Azure", "container", blobstore.containerName, "src", src, "dest", dest)
 	e := blobstore.client.GetContainerReference(blobstore.containerName).GetBlobReference(dest).Copy(
 		blobstore.client.GetContainerReference(blobstore.containerName).GetBlobReference(src).GetURL(), nil)
 
@@ -241,7 +293,7 @@ func (blobstore *Blobstore) Delete(path string) error {
 		return errors.Wrapf(e, "Path %v", path)
 	}
 	if !deleted {
-		return errors.New("bitsgo.NewNotFoundError()")
+		return bitsgo.NewNotFoundError()
 	}
 	return nil
 }
@@ -314,65 +366,62 @@ func (blobstore *Blobstore) handleError(e error, context string, args ...interfa
 	return errors.Wrapf(e, context, args...)
 }
 
-func (blobstore *Blobstore) newBlobLease(duration time.Duration, blob *storage.Blob) *azureBlobLease {
-	return &azureBlobLease{
-		DoneChannel:  make(chan bool, 1),
-		ErrorChannel: make(chan error, 1),
-		Duration:     duration,
-		Blobstore:    blobstore,
-		Blob:         blob,
-		LeaseID:      "",
-	}
-}
+// func (blobstore *Blobstore) newBlobLease(duration time.Duration, blob *storage.Blob) *azureBlobLease {
+// 	return &azureBlobLease{
+// 		DoneChannel:  make(chan bool, 1),
+// 		ErrorChannel: make(chan error, 1),
+// 		Duration:     duration,
+// 		Blobstore:    blobstore,
+// 		Blob:         blob,
+// 		LeaseID:      "",
+// 	}
+// }
 
-type azureBlobLease struct {
-	Duration     time.Duration
-	Blobstore    *Blobstore
-	Blob         *storage.Blob
-	LeaseID      string
-	DoneChannel  chan bool
-	ErrorChannel chan error
-}
+// type azureBlobLease struct {
+// 	Duration     time.Duration
+// 	Blobstore    *Blobstore
+// 	Blob         *storage.Blob
+// 	LeaseID      string
+// 	DoneChannel  chan bool
+// 	ErrorChannel chan error
+// }
 
-func (l *azureBlobLease) hold() error {
-	fmt.Printf("create lease on %s\n", l.Blob.Name)
+// func (l *azureBlobLease) acquire() error {
+// 	leaseDurationInSeconds := int(l.Duration.Seconds())
+// 	returnedLeaseID, err := l.Blob.AcquireLease(leaseDurationInSeconds, "", nil)
+// 	if err != nil {
+// 		if azse, ok := err.(storage.AzureStorageServiceError); ok && azse.StatusCode == http.StatusPreconditionFailed && azse.Code == "LeaseIdMissing" {
+// 			return l.Blobstore.handleError(azse, "Another upload is in progress for blob %s/%s", l.Blobstore.containerName, l.Blob.Name)
+// 		}
+// 		return err
+// 	}
 
-	leaseDurationInSeconds := int(l.Duration.Seconds())
-	returnedLeaseID, err := l.Blob.AcquireLease(leaseDurationInSeconds, "", nil)
-	if err != nil {
-		if azse, ok := err.(storage.AzureStorageServiceError); ok && azse.StatusCode == http.StatusPreconditionFailed && azse.Code == "LeaseIdMissing" {
-			return l.Blobstore.handleError(azse, "Another upload is in progress for blob %s/%s", l.Blobstore.containerName, l.Blob.Name)
-		}
-		return err
-	}
+// 	l.LeaseID = returnedLeaseID
+// 	go func(l *azureBlobLease) {
+// 		for {
+// 			select {
+// 			case done := <-l.DoneChannel:
+// 				if !done {
+// 				}
 
-	l.LeaseID = returnedLeaseID
-	go func(l *azureBlobLease) {
-		for {
-			select {
-			case done := <-l.DoneChannel:
-				if !done {
-				}
+// 				l.ErrorChannel <- l.Blob.ReleaseLease(l.LeaseID, &storage.LeaseOptions{})
+// 				return
+// 			case <-time.After(l.Duration):
+// 				err := l.Blob.RenewLease(l.LeaseID, nil)
+// 				if err != nil {
+// 					fmt.Printf("Error during RenewLease: %s\n", err)
+// 				}
+// 			}
+// 		}
+// 	}(l)
 
-				l.ErrorChannel <- l.Blob.ReleaseLease(l.LeaseID, nil)
-				return
-			case <-time.After(l.Duration):
-				err := l.Blob.RenewLease(l.LeaseID, nil)
-				if err != nil {
-					fmt.Printf("Error during RenewLease: %s\n", err)
-				}
-				fmt.Println("renew lease")
-			}
-		}
-	}(l)
+// 	return nil
+// }
 
-	return nil
-}
-
-func (l *azureBlobLease) release() error {
-	if l.LeaseID == "" {
-		return fmt.Errorf("Lease was not properly created")
-	}
-	l.DoneChannel <- true
-	return <-l.ErrorChannel
-}
+// func (l *azureBlobLease) release() error {
+// 	if l.LeaseID == "" {
+// 		return fmt.Errorf("Lease was not properly created")
+// 	}
+// 	l.DoneChannel <- true
+// 	return <-l.ErrorChannel
+// }
