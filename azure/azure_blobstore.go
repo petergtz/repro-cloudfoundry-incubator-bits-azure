@@ -1,6 +1,8 @@
 package azure
 
 import (
+	"bytes"
+	"crypto/md5"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -14,7 +16,6 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/storage"
 	"github.com/Azure/go-autorest/autorest"
-	"github.com/Azure/go-autorest/autorest/azure"
 	"github.com/cenkalti/backoff"
 	"github.com/pkg/errors"
 	"github.com/satori/go.uuid"
@@ -99,11 +100,12 @@ func NewBlobstoreWithDetails(config AzureBlobstoreConfig, putBlockSize int64, ma
 		logger.Log.Fatalw("putBlockSize must be equal or less than 100 MB", "putBlockSize", putBlockSize)
 		return nil
 	}
-	environment, e := azure.EnvironmentFromName(config.EnvironmentName())
-	if e != nil {
-		logger.Log.Fatalw("Could not get Azure Environment from Name", "error", e, "environment", config.EnvironmentName())
-	}
-	client, e := storage.NewBasicClientOnSovereignCloud(config.AccountName, config.AccountKey, environment)
+	// environment, e := azure.EnvironmentFromName(config.EnvironmentName())
+	// if e != nil {
+	// 	logger.Log.Fatalw("Could not get Azure Environment from Name", "error", e, "environment", config.EnvironmentName())
+	// }
+	// client, e := storage.NewBasicClientOnSovereignCloud(config.AccountName, config.AccountKey, environment)
+	client, e := storage.NewClient(config.AccountName, config.AccountKey, "core.windows.net", "2018-03-28", false)
 	if e != nil {
 		logger.Log.Fatalw("Could not instantiate Azure Basic Client", "error", e)
 	}
@@ -155,6 +157,7 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 	l.Debugw("Put", "bucket", blobstore.containerName, "path", path, "temporaryPath", temporaryPath)
 
 	temporaryBlob := blobstore.client.GetContainerReference(blobstore.containerName).GetBlobReference(temporaryPath)
+	overallMD5 := md5.New()
 	uncommittedBlocksList := make([]storage.Block, 0)
 	for i, eof := 0, false; !eof; {
 		if i >= maxBlocksPerBlob {
@@ -163,7 +166,16 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 		blockID := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%05d", i)))
 
 		data := make([]byte, blobstore.putBlockSize)
+		t1 := time.Now()
 		numBytesRead, e := src.Read(data)
+		t2 := time.Now()
+		if numBytesRead > 0 {
+			l.Debugw("Put",
+				"bytes-read-from-disk", numBytesRead,
+				"duration-disk-read", t2.Sub(t1).Seconds(),
+				"disk-read-throughput", fmt.Sprintf("%.1f byte/sec", float64(numBytesRead)/t2.Sub(t1).Seconds()))
+		}
+
 		if e != nil {
 			if e.Error() == "EOF" {
 				eof = true
@@ -181,9 +193,20 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 		}
 		l.Debugw("PutBlock", "block-index", i, "block-id", blockID, "block-size", numBytesRead, "is-eof", eof)
 
+		bytesToUpload := data[:numBytesRead]
+		blockMD5 := getMD5(bytesToUpload)
+		overallMD5.Write(bytesToUpload)
+
 		e = backoff.RetryNotify(func() error {
 			// return blob.PutBlock(blockID, data[:numBytesRead], &storage.PutBlockOptions{LeaseID: lease.LeaseID})
-			return temporaryBlob.PutBlock(blockID, data[:numBytesRead], &storage.PutBlockOptions{})
+			t1 := time.Now()
+			eInner := temporaryBlob.PutBlock(blockID, bytesToUpload, &storage.PutBlockOptions{ContentMD5: blockMD5})
+			t2 := time.Now()
+			l.Debugw("Put",
+				"azure-upload-bytes", numBytesRead,
+				"azure-upload-duration", t2.Sub(t1).Seconds(),
+				"azure-upload-throughput", fmt.Sprintf("%.1f byte/sec", float64(numBytesRead)/t2.Sub(t1).Seconds()))
+			return eInner
 		}, backoff.WithMaxRetries(backoff.NewExponentialBackOff(), 2), func(e error, d time.Duration) {
 			if azse, ok := e.(storage.AzureStorageServiceError); ok {
 				l.Infow("Retry PutBlock", "block-index", i, "block-id", blockID, "block-size", numBytesRead, "is-eof", eof, "error", e, "x-ms-request-id", azse.RequestID)
@@ -234,6 +257,12 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 		}
 	}
 
+	temporaryBlob.Properties.ContentMD5 = base64.StdEncoding.EncodeToString(overallMD5.Sum(nil))
+	l.Infow("Set ContentMD5", "ContentMD5", temporaryBlob.Properties.ContentMD5)
+	if e := temporaryBlob.SetProperties(&storage.SetBlobPropertiesOptions{}); e != nil {
+		return errors.Wrapf(e, "Could not set Content-MD5: %v, path: %v, put-request-id: %v", blobstore.containerName, path, putRequestID)
+	}
+
 	blob := blobstore.client.GetContainerReference(blobstore.containerName).GetBlobReference(path)
 	if e := blob.CreateBlockBlob(&storage.PutBlobOptions{}); e != nil {
 		if azse, ok := e.(storage.AzureStorageServiceError); ok && azse.StatusCode == http.StatusPreconditionFailed && azse.Code == "LeaseIdMissing" {
@@ -248,7 +277,7 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 	}
 	defer func() {
 		if err := lease.release(); err != nil {
-			fmt.Printf("Error during lease handling: %s", err)
+			l.Errorf("Error during lease handling: %s", err)
 		}
 		l.Debugw("ReleaseLease", "lease-id", lease.LeaseID)
 	}()
@@ -365,6 +394,12 @@ func (blobstore *Blobstore) handleError(e error, context string, args ...interfa
 		return errors.Errorf("bitsgo.NewNotFoundError()")
 	}
 	return errors.Wrapf(e, context, args...)
+}
+
+func getMD5(content []byte) string {
+	checkSumMD5 := md5.New()
+	io.Copy(checkSumMD5, bytes.NewReader(content))
+	return base64.StdEncoding.EncodeToString(checkSumMD5.Sum(nil))
 }
 
 func (blobstore *Blobstore) newBlobLease(duration time.Duration, blob *storage.Blob) *azureBlobLease {
