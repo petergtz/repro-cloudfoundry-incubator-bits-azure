@@ -1,7 +1,6 @@
 package azure
 
 import (
-	"bytes"
 	"crypto/md5"
 	"encoding/base64"
 	"fmt"
@@ -188,6 +187,14 @@ func uploadIsRequired(src io.ReadSeeker, blobContentLength int64, blobContentMD5
 }
 
 func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
+	//
+	// Upload strategy:
+	// Determine, whether the upload is needed. It's needed if the file is missing, or the size differs, or if the contents differ or we don't know whether contents differ.
+	// If upload is needed, do the following:
+	// It can happen that multiple clients request uploads into the same blob.
+	// To prevent collisions, each client uploads to a unique file first, then copies to the final blob, and deletes the original upload.
+	// The copy operation is protected by a blob lease
+	//
 	putRequestID := rand.Int63()
 	l := logger.Log.With("put-request-id", putRequestID)
 
@@ -203,13 +210,7 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 		return nil
 	}
 
-	//
-	// Upload strategy:
-	// It can happen that multiple clients request uploads into the same blob.
-	// To prevent collisions, each client uploads to a unique file first, then copies to the final blob, and deletes the original upload.
-	//
 	temporaryPath := fmt.Sprintf("%s.__upload__%d", path, putRequestID)
-
 	l.Debugw("Put", "bucket", blobstore.containerName, "path", path, "temporaryPath", temporaryPath)
 
 	temporaryBlob := blobstore.client.GetContainerReference(blobstore.containerName).GetBlobReference(temporaryPath)
@@ -229,7 +230,7 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 			l.Debugw("Put",
 				"disk-read-bytes", numBytesRead,
 				"disk-read-duration", t2.Sub(t1).Seconds(),
-				"disk-read-throughput", fmt.Sprintf("%.1f byte/sec", float64(numBytesRead)/t2.Sub(t1).Seconds()))
+				"disk-read-throughput", fmt.Sprintf("%.2f MB/s", float64(numBytesRead)/t2.Sub(t1).Seconds()/(1<<20)))
 		}
 
 		if e != nil {
@@ -261,7 +262,7 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 			l.Debugw("Put",
 				"azure-upload-bytes", numBytesRead,
 				"azure-upload-duration", t2.Sub(t1).Seconds(),
-				"azure-upload-throughput", fmt.Sprintf("%.1f byte/sec", float64(numBytesRead)/t2.Sub(t1).Seconds()))
+				"azure-upload-throughput", fmt.Sprintf("%.2f MB/sec", float64(numBytesRead)/t2.Sub(t1).Seconds()/(1<<20)))
 			return eInner
 		}, backoff.WithMaxRetries(backoff.NewExponentialBackOff(), 2), func(e error, d time.Duration) {
 			if azse, ok := e.(storage.AzureStorageServiceError); ok {
@@ -274,9 +275,9 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 		if e != nil {
 			if azse, ok := e.(storage.AzureStorageServiceError); ok {
 				return errors.Wrapf(e, "PutBlock() failed. path: %v, temporaryPath: %v, put-request-id: %v, x-ms-request-id: %s", path, temporaryPath, putRequestID, azse.RequestID)
-			} else {
-				return errors.Wrapf(e, "PutBlock() failed. path: %v, temporaryPath: %v, put-request-id: %v", path, temporaryPath, putRequestID)
 			}
+			return errors.Wrapf(e, "PutBlock() failed. path: %v, temporaryPath: %v, put-request-id: %v", path, temporaryPath, putRequestID)
+
 		}
 		uncommittedBlocksList = append(uncommittedBlocksList, storage.Block{
 			ID:     blockID,
@@ -299,7 +300,6 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 	}
 	l.Debugw("PutBlockList", "uncommitted-block-list", debugBlockIDAsString(uncommittedBlocksList))
 	putListErr := backoff.RetryNotify(func() error {
-		// return blob.PutBlockList(uncommittedBlocksList, &storage.PutBlockListOptions{LeaseID: lease.LeaseID})
 		return temporaryBlob.PutBlockList(uncommittedBlocksList, &storage.PutBlockListOptions{})
 	}, backoff.WithMaxRetries(backoff.NewExponentialBackOff(), 2), func(error, time.Duration) {
 		l.Infow("Retry PutBlockList", "uncommitted-block-list", debugBlockIDAsString(uncommittedBlocksList))
@@ -308,10 +308,10 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 	if putListErr != nil {
 		if azse, ok := putListErr.(storage.AzureStorageServiceError); ok {
 			return errors.Wrapf(putListErr, "PutBlockList() failed. path: %v, put-request-id: %v, x-ms-request-id: %s", path, putRequestID, azse.RequestID)
-		} else {
-			return errors.Wrapf(putListErr, "PutBlockList() failed. path: %v, put-request-id: %v", path, putRequestID)
 		}
+		return errors.Wrapf(putListErr, "PutBlockList() failed. path: %v, put-request-id: %v", path, putRequestID)
 	}
+	defer temporaryBlob.Delete(&storage.DeleteBlobOptions{})
 
 	temporaryBlob.Properties.ContentMD5 = base64.StdEncoding.EncodeToString(overallMD5.Sum(nil))
 	l.Infow("Set ContentMD5", "ContentMD5", temporaryBlob.Properties.ContentMD5)
@@ -329,6 +329,7 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 
 	lease := blobstore.newBlobLease(-1*time.Second, blob) // -1 is infinity
 	if err := lease.acquire(); err != nil {
+
 		return err
 	}
 	defer func() {
@@ -342,22 +343,10 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 	if copyErr := blob.Copy(temporaryBlob.GetURL(), &storage.CopyOptions{Destiny: storage.CopyOptionsConditions{LeaseID: lease.LeaseID}}); copyErr != nil {
 		if azse, ok := copyErr.(storage.AzureStorageServiceError); ok {
 			return errors.Wrapf(copyErr, "Copy() failed. path: %v, temporaryPath: %v, put-request-id: %v, x-ms-request-id: %s", path, temporaryPath, putRequestID, azse.RequestID)
-		} else {
-			return errors.Wrapf(copyErr, "Copy() failed. path: %v, temporaryPath: %v, put-request-id: %v", path, temporaryPath, putRequestID)
 		}
-	} else {
-		l.Debugw("Copy", "source-blob", temporaryBlob.GetURL(), "destination-blob", blob.GetURL())
+		return errors.Wrapf(copyErr, "Copy() failed. path: %v, temporaryPath: %v, put-request-id: %v", path, temporaryPath, putRequestID)
 	}
-
-	if deleteTempErr := temporaryBlob.Delete(&storage.DeleteBlobOptions{}); deleteTempErr != nil {
-		if azse, ok := deleteTempErr.(storage.AzureStorageServiceError); ok {
-			return errors.Wrapf(deleteTempErr, "Delete() failed. temporaryPath: %v, put-request-id: %v, x-ms-request-id: %s", temporaryPath, putRequestID, azse.RequestID)
-		} else {
-			return errors.Wrapf(deleteTempErr, "Delete() failed. temporaryPath: %v, put-request-id: %v", temporaryPath, putRequestID)
-		}
-	} else {
-		l.Debugw("Delete", "blob", temporaryBlob.GetURL())
-	}
+	l.Debugw("Copy", "source-blob", temporaryBlob.GetURL(), "destination-blob", blob.GetURL())
 
 	return nil
 }
@@ -454,7 +443,7 @@ func (blobstore *Blobstore) handleError(e error, context string, args ...interfa
 
 func getMD5(content []byte) string {
 	checkSumMD5 := md5.New()
-	io.Copy(checkSumMD5, bytes.NewReader(content))
+	checkSumMD5.Write(content)
 	return base64.StdEncoding.EncodeToString(checkSumMD5.Sum(nil))
 }
 
