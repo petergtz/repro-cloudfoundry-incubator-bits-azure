@@ -38,7 +38,7 @@ func main() {
 	config := bitazu.AzureBlobstoreConfig{
 		AccountName:   os.Getenv("SAMPLE_STORAGE_ACCOUNT_NAME"),
 		AccountKey:    os.Getenv("SAMPLE_STORAGE_ACCOUNT_KEY"),
-		ContainerName: "ocirocks2",
+		ContainerName: "ocirocks3",
 	}
 	var blockSize int64 = 50 << 20 // 256k
 	store := bitazu.NewBlobstoreWithDetails(config, blockSize, 5000)

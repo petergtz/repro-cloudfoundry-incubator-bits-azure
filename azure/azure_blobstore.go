@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"net/http"
 	"strings"
 	"time"
@@ -18,7 +19,6 @@ import (
 	"github.com/Azure/go-autorest/autorest"
 	"github.com/cenkalti/backoff"
 	"github.com/pkg/errors"
-	"github.com/satori/go.uuid"
 )
 
 const (
@@ -144,16 +144,72 @@ func (blobstore *Blobstore) GetOrRedirect(path string) (body io.ReadCloser, redi
 	return nil, signedUrl, e
 }
 
+func (blobstore *Blobstore) getBlobProps(path string) (exists bool, contentLength int64, contentMD5 string, err error) {
+	blob := blobstore.client.GetContainerReference(blobstore.containerName).GetBlobReference(path)
+	err = blob.GetProperties(&storage.GetBlobPropertiesOptions{})
+	if err != nil {
+		exists = false
+		contentLength = -1
+		contentMD5 = ""
+
+		if azse, ok := err.(storage.AzureStorageServiceError); ok && azse.StatusCode == 404 && strings.Contains(azse.Code, "blob does not exist") {
+			err = nil
+		}
+		return
+	}
+	exists = true
+	contentLength = blob.Properties.ContentLength
+	contentMD5 = blob.Properties.ContentMD5
+	return
+}
+
+func uploadIsRequired(src io.ReadSeeker, blobContentLength int64, blobContentMD5 string) (uploadRequired bool) {
+	inputLen, err := src.Seek(0, io.SeekEnd)
+	defer src.Seek(0, io.SeekStart)
+	if err != nil {
+		uploadRequired = true
+		return
+	}
+	if inputLen != blobContentLength {
+		uploadRequired = true
+		return
+	}
+	if blobContentMD5 == "" {
+		uploadRequired = true
+		return
+	}
+	src.Seek(0, io.SeekStart)
+	hash := md5.New()
+	io.Copy(hash, src)
+	localResourceMD5 := base64.StdEncoding.EncodeToString(hash.Sum(nil))
+
+	uploadRequired = blobContentMD5 != localResourceMD5
+	return
+}
+
 func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
+	putRequestID := rand.Int63()
+	l := logger.Log.With("put-request-id", putRequestID)
+
+	exists, contentLength, contentMD5, err := blobstore.getBlobProps(path)
+	if err != nil {
+		return errors.Wrapf(err, "Could not reach Azure blob storage. path: %v, put-request-id: %v", path, putRequestID)
+	}
+	l.Debugw("Put", "bucket", blobstore.containerName, "path", path, "exists", exists, "contentLength", contentLength, "contentMD5", contentMD5)
+
+	uploadRequired := uploadIsRequired(src, contentLength, contentMD5)
+	l.Infow("Put", "bucket", blobstore.containerName, "path", path, "uploadRequired", uploadRequired)
+	if !uploadRequired {
+		return nil
+	}
+
 	//
 	// Upload strategy:
 	// It can happen that multiple clients request uploads into the same blob.
 	// To prevent collisions, each client uploads to a unique file first, then copies to the final blob, and deletes the original upload.
 	//
-	putRequestID := uuid.Must(uuid.NewV4()) // rand.Int63()
-	temporaryPath := fmt.Sprintf("%s.__upload__%s", path, putRequestID)
+	temporaryPath := fmt.Sprintf("%s.__upload__%d", path, putRequestID)
 
-	l := logger.Log.With("put-request-id", putRequestID)
 	l.Debugw("Put", "bucket", blobstore.containerName, "path", path, "temporaryPath", temporaryPath)
 
 	temporaryBlob := blobstore.client.GetContainerReference(blobstore.containerName).GetBlobReference(temporaryPath)
@@ -171,8 +227,8 @@ func (blobstore *Blobstore) Put(path string, src io.ReadSeeker) error {
 		t2 := time.Now()
 		if numBytesRead > 0 {
 			l.Debugw("Put",
-				"bytes-read-from-disk", numBytesRead,
-				"duration-disk-read", t2.Sub(t1).Seconds(),
+				"disk-read-bytes", numBytesRead,
+				"disk-read-duration", t2.Sub(t1).Seconds(),
 				"disk-read-throughput", fmt.Sprintf("%.1f byte/sec", float64(numBytesRead)/t2.Sub(t1).Seconds()))
 		}
 
